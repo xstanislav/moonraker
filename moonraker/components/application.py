@@ -211,6 +211,7 @@ class MoonrakerApp:
             "/server/redirect",
             "/server/jsonrpc"
         ]
+        self.use_xheaders = config.getboolean("use_xheaders", True)
         self.max_upload_size = config.getint('max_upload_size', 1024)
         self.max_upload_size *= 1024 * 1024
 
@@ -323,7 +324,8 @@ class MoonrakerApp:
     def _create_http_server(
         self, port: int, address: str, **kwargs
     ) -> Optional[HTTPServer]:
-        args: Dict[str, Any] = dict(max_body_size=MAX_BODY_SIZE, xheaders=True)
+        args: Dict[str, Any]
+        args = dict(max_body_size=MAX_BODY_SIZE, xheaders=self.use_xheaders)
         args.update(kwargs)
         svr = HTTPServer(self.mutable_router, **args)
         try:
