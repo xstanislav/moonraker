@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog].
 - **build**: Bump pillow to version 12.2.0
 - **assets**: Clarify welcome message on landing page
 - **git_deploy**: Refactor git repo status refresh
+- **Authorization**:  Failed API Key comparisons now return a 401 status code.
+  Previously failed comparisons would proceed to Trusted Client auth.
+- **Websockets**:  Failed JWT and API Key authentication attempts will now
+  revoke "trusted client" authorization if present.
 
 ### Added
 - **metadata**: Auto-detect forks of PrusaSlicer.
@@ -24,12 +28,18 @@ The format is based on [Keep a Changelog].
 - **announcements**:  Add the `enable_moonlight` configuration option that
   may be used to enable/disable requests to retrieve announcement feeds from
   the Moonlight GitHub repository.
+- **application**: Added a `use_xheaders` option that may be set to False to
+  disable X-Header IP parsing for instances intended to be exclusively accessed
+  directly.
 
 ### Fixed
 - **mqtt**: Fixed TLS for version 2.0+ paho mqtt clients
 - **authorization**: Only perform password authentication on locally
   created users
 - **git_deploy**:  Detect a detached HEAD state when no branches are available.
+- **authorization**:  Trusted Client authorization now validates both the forwarded
+  IP address and the proxy IP address when applicable.
+- **Authorization**:  Constant time comparisons are now used to validate credentials.
 
 ## [0.10.0] - 2026-01-21
 
