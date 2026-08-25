@@ -6,12 +6,23 @@ The format is based on [Keep a Changelog].
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-25
+
 ### Changed
-- **machine**: Support standard reboot and shutdown commands
 - **build**: Switch to uv for project management
-- **build**: Bump tornado to version 6.5.6
-- **build**: Bump apprise to version 1.9.8
-- **build**: Bump pillow to version 12.2.0
+- **build**: Drop packaging support for EOL versions of python (3.7, 3.8, 3.9).
+  This change does not impact the minimum version when running from source.
+- **build**: Bump tornado to version 6.5.8
+- **build**: Bump apprise to version 1.13.0
+- **build**: Bump pillow to version 12.3.0
+- **build**: Bump streaming-form-data to version 2.1.0
+- **build**: Bump zeroconf to version 0.150.0
+- **build**: Bump dbus-fast to version 5.0.22
+- **build**: Bump importlib_metadata to version 9.0.0
+- **build**: Bump mkdocs-material to version 9.7.7 (docs requirement)
+- **build**: Bump pymdown-extensions to version 11.0.2 (docs requirement)
+- **build**: Bump pdm-backend to 2.4.9
+- **machine**: Support standard reboot and shutdown commands
 - **assets**: Clarify welcome message on landing page
 - **git_deploy**: Refactor git repo status refresh
 - **Authorization**:  Failed API Key comparisons now return a 401 status code.
@@ -356,7 +367,8 @@ The format is based on [Keep a Changelog].
 [api_changes.md]: api_changes.md
 
 <!-- Versions -->
-[unreleased]: https://github.com/Arksine/moonraker/compare/v0.10.0...HEAD
+[unreleased]: https://github.com/Arksine/moonraker/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/Arksine/moonraker/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/Arksine/moonraker/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/Arksine/moonraker/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/Arksine/moonraker/compare/v0.9.1...v0.9.2
