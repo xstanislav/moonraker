@@ -57,6 +57,7 @@ def build_archive(
     <metadata key="prediction" value="123"/>
     <metadata key="weight" value="4.5"/>
     <metadata key="support_used" value="false"/>
+    <warning msg="bed_temperature_too_high_than_filament" level="3" error_code="1000C001"/>
     <filament id="1" type="PLA" color="#FF0000" used_m="1.5" used_g="4.5"/>
     <object identify_id="1" name="part.stl" skipped="false"/>
   </plate>
@@ -152,6 +153,14 @@ def test_parse_3mf(tmp_path: Path) -> None:
     assert third["name"] == "Third plate"
     assert third["support_used"] is True
     assert third["printable"] is True
+    assert first["warnings"] == [
+        {
+            "message": "bed_temperature_too_high_than_filament",
+            "level": 3,
+            "code": "1000C001",
+        }
+    ]
+    assert third["warnings"] == []
 
     first_thumbs = first["thumbnails"]
     assert any(thumb["type"] == "thumbnail" and thumb["width"] == 512 for thumb in first_thumbs)

@@ -551,7 +551,15 @@ def _build_plate(
         ),
         "locked": _to_bool(plate_meta.get("locked", "false")),
         "printable": printable,
-        "warnings": [warning.get("msg", "") for warning in warnings if warning.get("msg")],
+        "warnings": [
+            {
+                "message": str(warning.get("msg", "")),
+                "level": _to_int(warning.get("level")),
+                "code": warning.get("error_code") or None,
+            }
+            for warning in warnings
+            if warning.get("msg")
+        ],
         "nozzles": nozzles,
         "thumbnails": [],
     }
