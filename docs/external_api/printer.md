@@ -608,6 +608,8 @@ POST /printer/print/start?filename=test_print.gcode
 | ---------- | :----: | ------------ | --------------------------------------------------- |
 | `filename` | string | **REQUIRED** | The name of the gcode file to print.  May be a path |
 |            |        |              | relative to the gcode folder.                       |^
+| `plate`    |  int   |              | The plate index to print.  Only valid for           |^
+|            |        |              | `.gcode.3mf` projects.                              |^
 ///
 
 ```{.text .apiresponse title="Response"}

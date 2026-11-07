@@ -9,6 +9,7 @@ import asyncio
 import time
 import logging
 from ..common import JobEvent, RequestType
+from .file_manager.three_mf import is_multi_plate_file
 
 # Annotation imports
 from typing import (
@@ -17,6 +18,7 @@ from typing import (
     Optional,
     Dict,
     List,
+    Tuple,
     Union,
 )
 if TYPE_CHECKING:
@@ -137,7 +139,8 @@ class JobQueue:
                             "Queue State Changed during Transition Gcode")
                 self._set_queue_state("starting")
                 await kapis.start_print(
-                    filename, wait_klippy_started=True, user=job.user
+                    filename, wait_klippy_started=True, user=job.user,
+                    plate=job.plate
                 )
             except self.server.error:
                 logging.exception(f"Error Loading print: {filename}")
@@ -167,23 +170,55 @@ class JobQueue:
         return True
 
     async def queue_job(self,
-                        filenames: Union[str, List[str]],
+                        filenames: Optional[Union[str, List[str]]] = None,
                         check_exists: bool = True,
                         reset: bool = False,
-                        user: Optional[UserInfo] = None
+                        user: Optional[UserInfo] = None,
+                        plate: Optional[int] = None,
+                        jobs: Optional[List[Dict[str, Any]]] = None
                         ) -> None:
         async with self.lock:
-            # Make sure that the file exists
-            if isinstance(filenames, str):
-                filenames = [filenames]
+            entries: List[Tuple[str, Optional[int]]] = []
+            if jobs is not None:
+                if not isinstance(jobs, list):
+                    raise self.server.error("Invalid 'jobs' argument")
+                for job in jobs:
+                    if not isinstance(job, dict):
+                        raise self.server.error("Invalid job entry")
+                    fname = job.get("filename")
+                    if not isinstance(fname, str) or not fname:
+                        raise self.server.error(
+                            "Job entry is missing a filename"
+                        )
+                    job_plate = job.get("plate", plate)
+                    if job_plate is not None:
+                        try:
+                            job_plate = int(job_plate)
+                        except (TypeError, ValueError):
+                            raise self.server.error(
+                                f"Invalid plate index: {job_plate}"
+                            )
+                    entries.append((fname, job_plate))
+            elif filenames is not None:
+                if isinstance(filenames, str):
+                    filenames = [filenames]
+                entries = [(fname, plate) for fname in filenames]
             if check_exists:
                 # Make sure all files exist before adding them to the queue
-                for fname in filenames:
-                    self._check_job_file(fname)
+                for fname, job_plate in entries:
+                    self._check_job_file(fname, job_plate)
             if reset:
                 self.queued_jobs.clear()
-            for fname in filenames:
-                queued_job = QueuedJob(fname, user)
+            fm: FileManager = self.server.lookup_component('file_manager')
+            for fname, job_plate in entries:
+                queued_job = QueuedJob(fname, job_plate, user)
+                if job_plate is not None:
+                    metadata = fm.get_file_metadata(fname)
+                    plates = metadata.get("plates", [])
+                    for plate_info in plates:
+                        if plate_info.get("index") == job_plate:
+                            queued_job.plate_name = plate_info.get("name")
+                            break
                 self.queued_jobs[queued_job.job_id] = queued_job
             self._send_queue_event(action="jobs_added")
             if self.automatic and not self.pause_requested:
@@ -241,11 +276,15 @@ class JobQueue:
         return [job.as_dict(cur_time) for
                 job in self.queued_jobs.values()]
 
-    def _check_job_file(self, job_name: str) -> None:
+    def _check_job_file(
+        self, job_name: str, plate: Optional[int] = None
+    ) -> None:
         fm: FileManager = self.server.lookup_component('file_manager')
         if not fm.check_file_exists("gcodes", job_name):
             raise self.server.error(
                 f"G-Code File {job_name} does not exist")
+        if plate is not None or is_multi_plate_file(job_name):
+            fm.check_plate_exists(job_name, plate)
 
     def _set_queue_state(self, new_state: str) -> None:
         if new_state != self.queue_state:
@@ -270,11 +309,17 @@ class JobQueue:
     ) -> Dict[str, Any]:
         req_type = web_request.get_request_type()
         if req_type == RequestType.POST:
-            files = web_request.get_list('filenames')
             reset = web_request.get_boolean("reset", False)
             # Validate that all files exist before queueing
             user = web_request.get_current_user()
-            await self.queue_job(files, reset=reset, user=user)
+            jobs = web_request.get('jobs', None)
+            if jobs is not None:
+                await self.queue_job(
+                    jobs=jobs, reset=reset, user=user
+                )
+            else:
+                files = web_request.get_list('filenames')
+                await self.queue_job(files, reset=reset, user=user)
         elif req_type == RequestType.DELETE:
             if web_request.get_boolean("all", False):
                 await self.delete_job([], all=True)
@@ -332,8 +377,15 @@ class JobQueue:
         await self.pause_queue()
 
 class QueuedJob:
-    def __init__(self, filename: str, user: Optional[UserInfo] = None) -> None:
+    def __init__(
+        self,
+        filename: str,
+        plate: Optional[int] = None,
+        user: Optional[UserInfo] = None
+    ) -> None:
         self.filename = filename
+        self.plate = plate
+        self.plate_name: Optional[str] = None
         self.job_id = f"{id(self):016X}"
         self.time_added = time.time()
         self._user = user
@@ -348,6 +400,9 @@ class QueuedJob:
     def as_dict(self, cur_time: float) -> Dict[str, Any]:
         return {
             'filename': self.filename,
+            'source_filename': self.filename,
+            'plate': self.plate,
+            'plate_name': self.plate_name,
             'job_id': self.job_id,
             'time_added': self.time_added,
             'time_in_queue': cur_time - self.time_added

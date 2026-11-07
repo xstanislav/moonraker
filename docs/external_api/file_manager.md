@@ -391,6 +391,8 @@ GET /server/files/thumbnails?filename=tools/drill.gcode
 | Name       | Type | Default      | Description                                                |
 | ---------- | :--: | ------------ | ---------------------------------------------------------- |
 | `filename` | str  | **REQUIRED** | The path to the gcode file, relative to the `gcodes` root. |
+| `plate`    | int  |              | For `.gcode.3mf` projects, only return the thumbnails of   |
+|            |      |              | the given plate.                                           |^
 
 ///
 
@@ -1086,6 +1088,10 @@ added to the form-data:
 | `print`    | string | `false`  | Available only for files uploaded to the `gcodes` root.  When  |
 |            |        |          | set to `true` Moonraker will command Klippy to start the print |^
 |            |        |          | after the upload has successfully completed.                   |^
+| `plate`    | int    |          | Available only for `.gcode.3mf` uploads to the `gcodes` root.  |
+|            |        |          | Selects the plate that will be printed or queued when `print`  |^
+|            |        |          | is `true`.  Required for multi-plate projects, optional when    |^
+|            |        |          | the project contains exactly one plate.                         |^
 
 ///
 
@@ -1131,6 +1137,94 @@ added to the form-data:
 In addition to the above returned object, all successful uploads will respond with
 a 201 response code and set the `Location` response header to the full path of
 the uploaded file.
+///
+
+## Extract multi-plate 3MF plate
+
+Extracts the G-Code of one plate from a multi-plate `.gcode.3mf` project
+(OrcaSlicer or Bambu Studio) into the multi-plate cache and returns details
+about the extracted file.  When the cached file exists and the source project
+has not changed the cached file is reused.
+
+```{.http .apirequest title="HTTP Request"}
+POST /server/files/extract_plate?filename=multi_plate_project.gcode.3mf&plate=3
+```
+```{.json .apirequest title="JSON-RPC Request"}
+{
+    "jsonrpc": "2.0",
+    "method": "server.files.extract_plate",
+    "params": {
+        "filename": "multi_plate_project.gcode.3mf",
+        "plate": 3
+    },
+    "id": 5645
+}
+```
+
+/// api-parameters
+    open: True
+
+| Name        | Type | Default | Description                                                    |
+| ----------- | :--: | ------- | -------------------------------------------------------------- |
+| `filename`  | str  |         | The path to the `.gcode.3mf` project, relative to the `gcodes` |
+|             |      |         | root.                                                          |^
+| `plate`     | int  |         | The plate index to extract.  Required unless the project       |
+|             |      |         | contains exactly one plate.                                    |^
+| `overwrite` | bool | `false` | When `true` an existing cached plate is re-extracted even if    |
+|             |      |         | the source project has not changed.                            |^
+
+///
+
+/// collapse-code
+```{.json .apiresponse title="Example Response"}
+{
+    "item": {
+        "root": "gcodes",
+        "path": ".3mf/multi_plate_project_a1b2c3d4/plate_3.gcode",
+        "modified": 1794081376.1,
+        "size": 8289321,
+        "permissions": "r"
+    },
+    "source": {
+        "filename": "multi_plate_project.gcode.3mf",
+        "root": "gcodes",
+        "path": "multi_plate_project.gcode.3mf",
+        "modified": 1794081049.9,
+        "size": 38351412,
+        "permissions": "rw"
+    },
+    "plate": {
+        "index": 3,
+        "name": "AB+Spool+Rail_stops",
+        "gcode_size": 8289321,
+        "gcode_md5": "D3B639AF6A480ACC04B692C96F7CEB7E",
+        "prediction": 4547,
+        "weight": 25.93,
+        "filament_type": ["ABS"],
+        "filament_colors": ["#008000"],
+        "filament_weights": [25.93],
+        "referenced_tools": [0],
+        "object_count": 3,
+        "support_used": true,
+        "bed_type": "textured_plate"
+    }
+}
+```
+///
+
+/// api-response-spec
+    open: True
+
+| Field    |  Type  | Description                                          |
+| -------- | :----: | ---------------------------------------------------- |
+| `item`   | object | The extracted G-Code file in the `gcodes` root.      |
+| `source` | object | The source `.gcode.3mf` project.                     |
+| `plate`  | object | Metadata of the extracted plate: `index`, `name`,    |
+|          |        | `gcode_size`, `gcode_md5`, `prediction` (seconds),   |^
+|          |        | `weight` (grams), `filament_type`, `filament_colors`, |^
+|          |        | `filament_weights`, `referenced_tools`,              |^
+|          |        | `object_count`, `support_used`, and `bed_type`.      |^
+
 ///
 
 ## File delete

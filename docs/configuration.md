@@ -165,6 +165,15 @@ enable_config_write_access: True
 #   When enabled the configuration folder is writable over the API.  Some
 #   installations, such as those in public areas, may wish to lock out
 #   configuration changes.  The default is True.
+enable_multi_plate_processing: True
+#   When enabled, `.gcode.3mf` projects exported by OrcaSlicer or Bambu
+#   Studio are parsed for plate metadata.  Plate G-Code is extracted on
+#   demand when printing, queueing, or viewing a plate.  The default is
+#   True.
+multi_plate_cache_path: .3mf
+#   Folder, relative to the `gcodes` root, used to store extracted plate
+#   G-Code.  This folder is read-only over the API.  The default is
+#   `.3mf`.
 ```
 
 /// Note

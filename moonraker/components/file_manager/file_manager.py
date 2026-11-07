@@ -12,6 +12,7 @@ import shutil
 import logging
 import tempfile
 import asyncio
+import hashlib
 import zipfile
 import time
 import math
@@ -23,6 +24,7 @@ from inotify_simple import flags as iFlags
 from ...utils import source_info
 from ...utils import json_wrapper as jsonw
 from ...common import RequestType, TransportType
+from . import three_mf
 
 # Annotation imports
 from typing import (
@@ -57,6 +59,14 @@ if TYPE_CHECKING:
     _T = TypeVar("_T")
 
 VALID_GCODE_EXTS = ['.gcode', '.g', '.gco', '.ufp', '.nc']
+
+
+def is_gcode_file(filename: str) -> bool:
+    if three_mf.is_multi_plate_file(filename):
+        return True
+    return os.path.splitext(filename.lower())[1] in VALID_GCODE_EXTS
+
+
 METADATA_SCRIPT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "metadata.py"))
 WATCH_FLAGS = iFlags.CREATE | iFlags.DELETE | iFlags.MODIFY \
@@ -75,6 +85,7 @@ class FileManager:
         srcdir = str(source_info.source_path())
         self.add_reserved_path("moonraker", srcdir, False)
         db: DBComp = self.server.load_component(config, "database")
+        self.db = db
         db_path = db.get_database_path()
         self.add_reserved_path("database", db_path, False)
         self.add_reserved_path("certs", self.datapath.joinpath("certs"), False)
@@ -105,6 +116,14 @@ class FileManager:
         self.fixed_path_args: Dict[str, Any] = {}
         self.queue_gcodes: bool = config.getboolean('queue_gcode_uploads', False)
         self.check_klipper_path = config.getboolean("check_klipper_config_path", True)
+        self.enable_multi_plate = config.getboolean(
+            "enable_multi_plate_processing", True
+        )
+        self.multi_plate_cache_path = config.get(
+            "multi_plate_cache_path", ".3mf"
+        ).strip("/") or ".3mf"
+        self.multi_plate_cache: Dict[str, Dict[str, Any]] = {}
+        self.multi_plate_locks: Dict[str, asyncio.Lock] = {}
 
         # Register file management endpoints
         self.server.register_endpoint(
@@ -134,6 +153,10 @@ class FileManager:
         )
         self.server.register_endpoint(
             "/server/files/zip", RequestType.POST, self._handle_zip_files
+        )
+        self.server.register_endpoint(
+            "/server/files/extract_plate", RequestType.POST,
+            self._handle_extract_plate_request
         )
         self.server.register_endpoint(
             "/server/files/delete_file", RequestType.DELETE, self._handle_file_delete,
@@ -176,8 +199,417 @@ class FileManager:
             if prune:
                 self.gcode_metadata.prune_storage()
 
+    async def component_init(self) -> None:
+        await self._load_multi_plate_cache()
+
     def start_file_observer(self):
         self.fs_observer.initialize()
+
+    async def _load_multi_plate_cache(self) -> None:
+        if not self.enable_multi_plate:
+            return
+        try:
+            cached = await self.db.get_item(
+                "moonraker", "file_manager.multi_plate_cache", {}
+            )
+        except Exception:
+            logging.exception("Failed to load multi-plate cache")
+            cached = {}
+        if isinstance(cached, dict):
+            self.multi_plate_cache = cached
+        await self._reconcile_multi_plate_cache()
+
+    async def _save_multi_plate_cache(self) -> None:
+        if not self.enable_multi_plate:
+            return
+        try:
+            await self.db.insert_item(
+                "moonraker", "file_manager.multi_plate_cache",
+                self.multi_plate_cache
+            )
+        except Exception:
+            logging.exception("Failed to save multi-plate cache")
+
+    def _schedule_save_multi_plate_cache(self) -> None:
+        self.event_loop.create_task(self._save_multi_plate_cache())
+
+    def _multi_plate_cache_root(self) -> pathlib.Path:
+        return pathlib.Path(self.file_paths["gcodes"]).joinpath(
+            self.multi_plate_cache_path
+        )
+
+    def _multi_plate_cache_dir(self, source_rel: str) -> pathlib.Path:
+        safe_base = three_mf.safe_thumb_base(source_rel)
+        digest = hashlib.sha256(source_rel.encode()).hexdigest()[:8]
+        return self._multi_plate_cache_root().joinpath(
+            f"{safe_base}_{digest}"
+        )
+
+    def _multi_plate_plate_path(
+        self, source_rel: str, plate: int
+    ) -> pathlib.Path:
+        return self._multi_plate_cache_dir(source_rel).joinpath(
+            f"plate_{plate}.gcode"
+        )
+
+    def _normalize_source_rel(self, filename: str) -> str:
+        filename = filename.lstrip("/")
+        if filename.startswith("gcodes/"):
+            filename = filename[7:]
+        return filename
+
+    def _multi_plate_rel_path(self, path: pathlib.Path) -> str:
+        return os.path.relpath(path, self.file_paths["gcodes"])
+
+    def _is_cache_dir_loaded(self, cache_dir: pathlib.Path) -> bool:
+        job_state: Optional[JobState] = self.server.lookup_component(
+            "job_state", None
+        )
+        if job_state is None:
+            return False
+        stats = job_state.get_last_stats()
+        if stats.get("state") not in ("printing", "paused"):
+            return False
+        loaded_file = stats.get("filename", "")
+        if not loaded_file:
+            return False
+        loaded_path = pathlib.Path(self.file_paths["gcodes"]).joinpath(
+            loaded_file
+        )
+        try:
+            return loaded_path.resolve().is_relative_to(cache_dir.resolve())
+        except (OSError, ValueError):
+            return False
+
+    async def _reconcile_multi_plate_cache(self) -> None:
+        if not self.enable_multi_plate:
+            return
+        gcodes_root = pathlib.Path(self.file_paths["gcodes"])
+        changed = False
+        for source_rel, entry in list(self.multi_plate_cache.items()):
+            source_path = gcodes_root.joinpath(source_rel)
+            cache_dir = gcodes_root.joinpath(entry.get("cache_dir", ""))
+            if not source_path.is_file() or not cache_dir.is_dir():
+                if not self._is_cache_dir_loaded(cache_dir):
+                    for plate_entry in entry.get("plates", {}).values():
+                        plate_rel = plate_entry.get("path")
+                        if not plate_rel:
+                            continue
+                        ret = self.gcode_metadata.remove_file_metadata(
+                            plate_rel
+                        )
+                        if ret is not None:
+                            await ret
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                self.multi_plate_cache.pop(source_rel, None)
+                changed = True
+                continue
+            stat = source_path.stat()
+            if (
+                entry.get("source_size") != stat.st_size or
+                not math.isclose(
+                    entry.get("source_modified", 0.0), stat.st_mtime
+                )
+            ):
+                if not self._is_cache_dir_loaded(cache_dir):
+                    for plate_entry in entry.get("plates", {}).values():
+                        plate_rel = plate_entry.get("path")
+                        if not plate_rel:
+                            continue
+                        ret = self.gcode_metadata.remove_file_metadata(
+                            plate_rel
+                        )
+                        if ret is not None:
+                            await ret
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                self.multi_plate_cache.pop(source_rel, None)
+                changed = True
+        if changed:
+            await self._save_multi_plate_cache()
+
+    def check_plate_exists(
+        self, filename: str, plate: Optional[int]
+    ) -> int:
+        source_rel = self._normalize_source_rel(filename)
+        source_path = pathlib.Path(self.file_paths["gcodes"]).joinpath(
+            source_rel
+        )
+        if not source_path.is_file():
+            raise self.server.error(
+                f"G-Code File {source_rel} does not exist"
+            )
+        if not three_mf.is_multi_plate_file(source_rel):
+            if plate is not None:
+                raise self.server.error(
+                    "The 'plate' argument is only valid for .gcode.3mf files"
+                )
+            return 0
+        try:
+            indexes = three_mf.get_plate_indexes(str(source_path))
+        except Exception as e:
+            raise self.server.error(
+                f"Unable to read multi-plate project {source_rel}: {e}"
+            ) from e
+        if not indexes:
+            raise self.server.error(
+                f"File {source_rel} does not contain sliced plate G-code"
+            )
+        if plate is None:
+            if len(indexes) == 1:
+                return indexes[0]
+            raise self.server.error(
+                "A plate index is required for this multi-plate project. "
+                f"Available plates: {', '.join(str(i) for i in indexes)}"
+            )
+        if plate not in indexes:
+            raise self.server.error(
+                f"Plate {plate} is not available. "
+                f"Available plates: {', '.join(str(i) for i in indexes)}"
+            )
+        return plate
+
+    async def _ensure_multi_plate_metadata(
+        self,
+        rel_path: str,
+        full_path: pathlib.Path,
+        source_rel: str,
+        plate_info: Dict[str, Any]
+    ) -> None:
+        path_info = self.get_path_info(full_path, "gcodes")
+        evt = self.gcode_metadata.parse_metadata(rel_path, path_info)
+        await evt.wait()
+        metadata = self.gcode_metadata.get(rel_path, {})
+        if not isinstance(metadata, dict):
+            return
+        source_metadata = self.gcode_metadata.get(source_rel, {})
+        metadata.update({
+            "source_filename": source_rel,
+            "source_plate": plate_info.get("index"),
+            "source_plate_name": plate_info.get("name"),
+            "source_uuid": (
+                source_metadata.get("uuid")
+                if isinstance(source_metadata, dict) else None
+            ),
+            "is_multi_plate_extract": True,
+        })
+        self.gcode_metadata.insert(rel_path, metadata)
+
+    def _multi_plate_response(
+        self,
+        source_rel: str,
+        source_path: pathlib.Path,
+        plate_info: Dict[str, Any],
+        dest_path: pathlib.Path
+    ) -> Dict[str, Any]:
+        rel_path = self._multi_plate_rel_path(dest_path)
+        return {
+            "item": {
+                "root": "gcodes",
+                "path": rel_path,
+                **self.get_path_info(dest_path, "gcodes"),
+            },
+            "source": {
+                "filename": source_rel,
+                **self.get_path_info(source_path, "gcodes"),
+            },
+            "plate": {
+                "index": plate_info.get("index"),
+                "name": plate_info.get("name"),
+                "gcode_size": plate_info.get("gcode_size"),
+                "gcode_md5": plate_info.get("gcode_md5"),
+                "prediction": plate_info.get("prediction"),
+                "weight": plate_info.get("weight"),
+                "filament_type": plate_info.get("filament_type"),
+                "filament_colors": plate_info.get("filament_colors"),
+                "filament_weights": plate_info.get("filament_weights"),
+                "referenced_tools": plate_info.get("referenced_tools"),
+                "object_count": plate_info.get("object_count"),
+                "support_used": plate_info.get("support_used"),
+                "bed_type": plate_info.get("bed_type"),
+            },
+        }
+
+    async def extract_multi_plate(
+        self, filename: str, plate: Optional[int], overwrite: bool = False
+    ) -> Dict[str, Any]:
+        if not self.enable_multi_plate:
+            raise self.server.error(
+                "Multi-plate 3MF processing is disabled", 400
+            )
+        source_rel = self._normalize_source_rel(filename)
+        if not three_mf.is_multi_plate_file(source_rel):
+            raise self.server.error(
+                f"File {source_rel} is not a multi-plate project", 400
+            )
+        plate_index = self.check_plate_exists(source_rel, plate)
+        gcodes_root = pathlib.Path(self.file_paths["gcodes"])
+        source_path = gcodes_root.joinpath(source_rel)
+        lock = self.multi_plate_locks.setdefault(source_rel, asyncio.Lock())
+        async with lock:
+            stat = source_path.stat()
+            cache_dir = self._multi_plate_cache_dir(source_rel)
+            dest_path = self._multi_plate_plate_path(source_rel, plate_index)
+            rel_path = self._multi_plate_rel_path(dest_path)
+            entry = self.multi_plate_cache.get(source_rel)
+            source_unchanged = (
+                entry is not None and
+                entry.get("source_size") == stat.st_size and
+                math.isclose(entry.get("source_modified", 0.0), stat.st_mtime)
+            )
+            plate_info: Optional[Dict[str, Any]] = None
+            if source_unchanged and not overwrite and dest_path.is_file():
+                try:
+                    plate_info = await self.event_loop.run_in_thread(
+                        three_mf.get_plate_info, str(source_path), plate_index
+                    )
+                except Exception:
+                    plate_info = None
+                if plate_info is not None:
+                    cached_plate = entry.get("plates", {}).get(
+                        str(plate_index), {}
+                    )
+                    cached_md5 = cached_plate.get("md5")
+                    expected_md5 = plate_info.get("gcode_md5")
+                    md5_matches = (
+                        not expected_md5 or
+                        not cached_md5 or
+                        str(cached_md5).lower() == str(expected_md5).lower()
+                    )
+                    size_matches = (
+                        dest_path.stat().st_size == plate_info.get("gcode_size")
+                    )
+                    if md5_matches and size_matches:
+                        await self._ensure_multi_plate_metadata(
+                            rel_path, dest_path, source_rel, plate_info
+                        )
+                        return self._multi_plate_response(
+                            source_rel, source_path, plate_info, dest_path
+                        )
+            if not source_unchanged and cache_dir.exists():
+                if self._is_cache_dir_loaded(cache_dir):
+                    raise self.server.error(
+                        "The source project changed while an extracted plate "
+                        "is printing", 409
+                    )
+                if entry is not None:
+                    for plate_entry in entry.get("plates", {}).values():
+                        plate_rel = plate_entry.get("path")
+                        if not plate_rel:
+                            continue
+                        ret = self.gcode_metadata.remove_file_metadata(
+                            plate_rel
+                        )
+                        self._schedule_metadata_cleanup(ret)
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            if plate_info is None:
+                plate_info = await self.event_loop.run_in_thread(
+                    three_mf.get_plate_info, str(source_path), plate_index
+                )
+            extracted = await self.event_loop.run_in_thread(
+                three_mf.extract_plate,
+                str(source_path), plate_index, str(dest_path), plate_info
+            )
+            if entry is None or not source_unchanged:
+                entry = {
+                    "source_size": stat.st_size,
+                    "source_modified": stat.st_mtime,
+                    "cache_dir": self._multi_plate_rel_path(cache_dir),
+                    "plates": {},
+                }
+                self.multi_plate_cache[source_rel] = entry
+            entry["plates"][str(plate_index)] = {
+                "path": rel_path,
+                "md5": extracted.get("gcode_md5"),
+                "size": extracted.get("gcode_size"),
+            }
+            await self._save_multi_plate_cache()
+            await self._ensure_multi_plate_metadata(
+                rel_path, dest_path, source_rel, plate_info
+            )
+            return self._multi_plate_response(
+                source_rel, source_path, plate_info, dest_path
+            )
+
+    async def resolve_print_target(
+        self, filename: str, plate: Optional[int]
+    ) -> str:
+        source_rel = self._normalize_source_rel(filename)
+        if not three_mf.is_multi_plate_file(source_rel):
+            if plate is not None:
+                raise self.server.error(
+                    "The 'plate' argument is only valid for .gcode.3mf files"
+                )
+            return filename
+        result = await self.extract_multi_plate(source_rel, plate)
+        return result["item"]["path"]
+
+    def _schedule_metadata_cleanup(self, result: Any) -> None:
+        # Futures returned by run_in_thread() are already scheduled, while
+        # metadata helpers may return a coroutine that still needs a task.
+        if asyncio.iscoroutine(result):
+            self.event_loop.create_task(result)
+
+    def clear_multi_plate_cache(self, source_rel: str) -> None:
+        source_rel = self._normalize_source_rel(source_rel)
+        entry = self.multi_plate_cache.pop(source_rel, None)
+        if entry is None:
+            return
+        gcodes_root = pathlib.Path(self.file_paths["gcodes"])
+        cache_dir = gcodes_root.joinpath(entry.get("cache_dir", ""))
+        if self._is_cache_dir_loaded(cache_dir):
+            self.multi_plate_cache[source_rel] = entry
+            logging.info(
+                f"Delaying cleanup of multi-plate cache while printing: "
+                f"{cache_dir}"
+            )
+            return
+        for plate_entry in entry.get("plates", {}).values():
+            plate_rel = plate_entry.get("path")
+            if not plate_rel:
+                continue
+            ret = self.gcode_metadata.remove_file_metadata(plate_rel)
+            self._schedule_metadata_cleanup(ret)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        self._schedule_save_multi_plate_cache()
+
+    def move_multi_plate_cache(self, prev_rel: str, new_rel: str) -> None:
+        prev_rel = self._normalize_source_rel(prev_rel)
+        new_rel = self._normalize_source_rel(new_rel)
+        entry = self.multi_plate_cache.pop(prev_rel, None)
+        if entry is None:
+            return
+        gcodes_root = pathlib.Path(self.file_paths["gcodes"])
+        old_dir = gcodes_root.joinpath(entry.get("cache_dir", ""))
+        new_dir = self._multi_plate_cache_dir(new_rel)
+        if old_dir.is_dir() and not self._is_cache_dir_loaded(old_dir):
+            if new_dir.exists():
+                shutil.rmtree(new_dir, ignore_errors=True)
+            new_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_dir), str(new_dir))
+            for plate_entry in entry.get("plates", {}).values():
+                plate_rel = plate_entry.get("path")
+                if not plate_rel:
+                    continue
+                plate_name = os.path.basename(plate_rel)
+                new_plate_rel = self._multi_plate_rel_path(
+                    new_dir.joinpath(plate_name)
+                )
+                ret = self.gcode_metadata.move_file_metadata(
+                    plate_rel, new_plate_rel
+                )
+                self._schedule_metadata_cleanup(ret)
+                plate_entry["path"] = new_plate_rel
+        entry["cache_dir"] = self._multi_plate_rel_path(new_dir)
+        self.multi_plate_cache[new_rel] = entry
+        self._schedule_save_multi_plate_cache()
+
+    async def _handle_extract_plate_request(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        filename: str = web_request.get_str("filename")
+        plate = web_request.get_int("plate", None)
+        overwrite = web_request.get_boolean("overwrite", False)
+        return await self.extract_multi_plate(filename, plate, overwrite)
 
     def _update_fixed_paths(self) -> None:
         kinfo = self.server.get_klippy_info()
@@ -313,6 +745,15 @@ class FileManager:
             if root == "gcodes":
                 # scan for metadata changes
                 self.gcode_metadata.update_gcode_path(path)
+                if getattr(self, "enable_multi_plate", False):
+                    self.reserved_paths.pop("multi_plate_cache", None)
+                    self.add_reserved_path(
+                        "multi_plate_cache",
+                        pathlib.Path(path).joinpath(
+                            self.multi_plate_cache_path
+                        ),
+                        read_access=True
+                    )
             if full_access:
                 # Refresh the file list and add watches
                 self.fs_observer.add_root_watch(root, path)
@@ -440,7 +881,7 @@ class FileManager:
             gcpath = pathlib.Path(self.file_paths["gcodes"]).joinpath(requested_file)
             if not gcpath.is_file():
                 raise self.server.error(f"File '{requested_file}' does not exist", 404)
-            if gcpath.suffix not in VALID_GCODE_EXTS:
+            if not is_gcode_file(gcpath.name):
                 raise self.server.error(f"File {gcpath} is not a valid gcode file")
             # remove metadata and force a rescan
             ret = self.gcode_metadata.remove_file_metadata(requested_file)
@@ -481,6 +922,12 @@ class FileManager:
         if "thumbnails" not in metadata:
             return []
         thumblist: List[Dict[str, Any]] = metadata["thumbnails"]
+        plate = web_request.get_int("plate", None)
+        if plate is not None:
+            thumblist = [
+                info for info in thumblist
+                if info.get("plate") in (None, plate)
+            ]
         for info in thumblist:
             relpath: Optional[str] = info.pop("relative_path", None)
             if relpath is None:
@@ -536,6 +983,16 @@ class FileManager:
                         os.rmdir(dir_path)
                     except Exception as e:
                         raise self.server.error(str(e))
+                if root == "gcodes":
+                    rel_dir = self.get_relative_path(
+                        "gcodes", dir_path
+                    ).rstrip("/")
+                    for source_rel in list(self.multi_plate_cache):
+                        if (
+                            source_rel == rel_dir or
+                            source_rel.startswith(rel_dir + "/")
+                        ):
+                            self.clear_multi_plate_cache(source_rel)
                 self.fs_observer.on_item_delete(root, dir_path, is_dir=True)
             else:
                 raise self.server.error("Operation Not Supported", 405)
@@ -559,8 +1016,42 @@ class FileManager:
                 # Check to see of the loaded file is in the request
                 if full_path.startswith(requested_path):
                     raise self.server.error("File currently in use", 403)
+                rel_dir = self.get_relative_path(
+                    "gcodes", requested_path
+                ).rstrip("/")
+                for source_rel, entry in self.multi_plate_cache.items():
+                    if (
+                        source_rel == rel_dir or
+                        source_rel.startswith(rel_dir + "/")
+                    ):
+                        cache_dir = os.path.join(
+                            gc_path, entry.get("cache_dir", "")
+                        )
+                        if (
+                            full_path == cache_dir or
+                            full_path.startswith(cache_dir + os.sep)
+                        ):
+                            raise self.server.error(
+                                "A plate from this project is currently "
+                                "printing", 403
+                            )
             elif full_path == requested_path:
                 raise self.server.error("File currently in use", 403)
+            rel_path = self.get_relative_path("gcodes", requested_path)
+            if three_mf.is_multi_plate_file(rel_path):
+                entry = self.multi_plate_cache.get(rel_path)
+                if entry is not None:
+                    cache_dir = os.path.join(
+                        gc_path, entry.get("cache_dir", "")
+                    )
+                    if (
+                        full_path == cache_dir or
+                        full_path.startswith(cache_dir + os.sep)
+                    ):
+                        raise self.server.error(
+                            "A plate from this project is currently printing",
+                            403
+                        )
         return not is_printing
 
     def _convert_request_path(self, request_path: str) -> Tuple[str, str]:
@@ -633,6 +1124,15 @@ class FileManager:
             except Exception as e:
                 raise self.server.error(str(e)) from e
             if action.startswith("move"):
+                if (
+                    source_root == "gcodes" and
+                    dest_root == "gcodes" and
+                    three_mf.is_multi_plate_file(source_path)
+                ):
+                    self.move_multi_plate_cache(
+                        self.get_relative_path("gcodes", source_path),
+                        self.get_relative_path("gcodes", full_dest)
+                    )
                 ret = self.fs_observer.on_item_move(
                     source_root, dest_root, source_path, full_dest
                 )
@@ -759,10 +1259,9 @@ class FileManager:
             elif os.path.isfile(full_path):
                 path_info['filename'] = fname
                 # Check to see if a filelist update is necessary
-                ext = os.path.splitext(fname)[-1].lower()
                 if (
                     root == "gcodes" and
-                    ext in VALID_GCODE_EXTS and
+                    is_gcode_file(fname) and
                     is_extended
                 ):
                     rel_path = self.get_relative_path(root, full_path)
@@ -829,7 +1328,9 @@ class FileManager:
                 root = upload_info['root']
                 if root not in self.full_access_roots:
                     raise self.server.error(f"Invalid root request: {root}")
-                if root == "gcodes" and upload_info['ext'] in VALID_GCODE_EXTS:
+                if root == "gcodes" and upload_info['multi_plate']:
+                    result = await self._finish_multi_plate_upload(upload_info)
+                elif root == "gcodes" and is_gcode_file(upload_info['dest_path']):
                     result = await self._finish_gcode_upload(upload_info)
                 else:
                     result = await self._finish_standard_upload(upload_info)
@@ -867,7 +1368,15 @@ class FileManager:
             raise self.server.error(
                 f"Cannot write to path: {dest_path}")
         start_print: bool = upload_args.get('print', "false") == "true"
-        f_ext = os.path.splitext(dest_path)[-1].lower()
+        f_ext = three_mf.get_file_ext(dest_path)
+        multi_plate = root == "gcodes" and three_mf.is_multi_plate_file(dest_path)
+        plate_arg = upload_args.get('plate', "")
+        plate: Optional[int] = None
+        if plate_arg not in (None, ""):
+            try:
+                plate = int(plate_arg)
+            except (TypeError, ValueError):
+                raise self.server.error(f"Invalid plate index: {plate_arg}")
         unzip_ufp = f_ext == ".ufp" and root == "gcodes"
         if unzip_ufp:
             filename = os.path.splitext(filename)[0] + ".gcode"
@@ -889,6 +1398,8 @@ class FileManager:
             'start_print': start_print,
             'unzip_ufp': unzip_ufp,
             'ext': f_ext,
+            'multi_plate': multi_plate,
+            'plate': plate,
             "is_link": os.path.islink(dest_path),
             "user": upload_args.get("current_user")
         }
@@ -932,6 +1443,90 @@ class FileManager:
             immediate=upload_info["is_link"]
         ))
         result.update({"print_started": started, "print_queued": queued})
+        return result
+
+    async def _finish_multi_plate_upload(
+        self, upload_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        tmp_path = upload_info['tmp_file_path']
+        try:
+            indexes = await self.event_loop.run_in_thread(
+                three_mf.get_plate_indexes, tmp_path
+            )
+        except Exception as e:
+            raise self.server.error(
+                f"Unable to read multi-plate project: {e}"
+            ) from e
+        if not indexes:
+            raise self.server.error(
+                "The uploaded 3MF does not contain sliced plate G-code"
+            )
+        plate: Optional[int] = upload_info.get('plate')
+        if plate is None:
+            if len(indexes) == 1:
+                plate = indexes[0]
+            elif upload_info['start_print']:
+                raise self.server.error(
+                    "A plate index is required when printing a multi-plate "
+                    f"project. Available plates: {', '.join(str(i) for i in indexes)}"
+                )
+        elif plate not in indexes:
+            raise self.server.error(
+                f"Plate {plate} is not available. "
+                f"Available plates: {', '.join(str(i) for i in indexes)}"
+            )
+        upload_info['plate'] = plate
+        can_start: bool = False
+        try:
+            can_start = self._handle_operation_check(
+                upload_info['dest_path']
+            )
+        except self.server.error as e:
+            if e.status_code == 403:
+                raise self.server.error(
+                    "File is loaded, upload not permitted", 403
+                )
+        finfo = await self._process_uploaded_file(upload_info)
+        await self.gcode_metadata.parse_metadata(
+            upload_info['filename'], finfo
+        ).wait()
+        started: bool = False
+        queued: bool = False
+        if upload_info['start_print']:
+            user: Optional[UserInfo] = upload_info.get("user")
+            if can_start:
+                kapis: APIComp = self.server.lookup_component(
+                    'klippy_apis'
+                )
+                try:
+                    await kapis.start_print(
+                        upload_info['filename'], user=user, plate=plate
+                    )
+                except self.server.error:
+                    pass
+                else:
+                    started = True
+            if self.queue_gcodes and not started:
+                job_queue: JobQueue = self.server.lookup_component(
+                    'job_queue'
+                )
+                await job_queue.queue_job(
+                    upload_info['filename'], check_exists=False,
+                    user=user, plate=plate
+                )
+                queued = True
+        self.fs_observer.on_item_create(
+            "gcodes", upload_info["dest_path"]
+        )
+        result = dict(self._sched_changed_event(
+            "create_file", "gcodes", upload_info["dest_path"],
+            immediate=upload_info["is_link"]
+        ))
+        result.update({
+            "print_started": started,
+            "print_queued": queued,
+            "plate": plate,
+        })
         return result
 
     async def _finish_standard_upload(
@@ -1007,8 +1602,7 @@ class FileManager:
                         scan_dirs.append(dname)
             dir_names[:] = scan_dirs
             for name in files:
-                ext = os.path.splitext(name)[-1].lower()
-                if root == 'gcodes' and ext not in VALID_GCODE_EXTS:
+                if root == 'gcodes' and not is_gcode_file(name):
                     continue
                 full_path = os.path.join(dir_path, name)
                 if not os.path.exists(full_path):
@@ -1063,8 +1657,7 @@ class FileManager:
                 simple_list.append("*" + dirobj['dirname'])
             for fileobj in flist['files']:
                 fname = fileobj['filename']
-                ext = os.path.splitext(fname)[-1].lower()
-                if root == "gcodes" and ext in VALID_GCODE_EXTS:
+                if root == "gcodes" and is_gcode_file(fname):
                     simple_list.append(fname)
             return simple_list
         return flist
@@ -1091,6 +1684,13 @@ class FileManager:
                     raise
             self.sync_lock.setup("delete_file", full_path)
             os.remove(full_path)
+            if (
+                root == "gcodes" and
+                three_mf.is_multi_plate_file(full_path)
+            ):
+                self.clear_multi_plate_cache(
+                    self.get_relative_path("gcodes", full_path)
+                )
             self.fs_observer.on_item_delete(root, full_path)
             return self._sched_changed_event("delete_file", root, full_path)
 
@@ -1336,6 +1936,10 @@ class BaseFileSystemObserver:
                 if is_dir:
                     gcm.move_directory_metadata(prev_rel_path, new_rel_path)
                 else:
+                    if three_mf.is_multi_plate_file(prev_rel_path):
+                        fm.move_multi_plate_cache(
+                            prev_rel_path, new_rel_path
+                        )
                     return gcm.move_file_metadata(prev_rel_path, new_rel_path)
             else:
                 # move from a non-gcodes root to gcodes root needs a rescan
@@ -1353,7 +1957,18 @@ class BaseFileSystemObserver:
             rel_path = self.file_manager.get_relative_path(root, str(path))
             if is_dir:
                 self.gcode_metadata.remove_directory_metadata(rel_path)
+                rel_dir = rel_path.rstrip("/")
+                for source_rel in list(
+                    self.file_manager.multi_plate_cache
+                ):
+                    if (
+                        source_rel == rel_dir or
+                        source_rel.startswith(rel_dir + "/")
+                    ):
+                        self.file_manager.clear_multi_plate_cache(source_rel)
             else:
+                if three_mf.is_multi_plate_file(rel_path):
+                    self.file_manager.clear_multi_plate_cache(rel_path)
                 self.gcode_metadata.remove_file_metadata(rel_path)
 
     def parse_gcode_metadata(self, file_path: str) -> asyncio.Event:
@@ -1364,7 +1979,7 @@ class BaseFileSystemObserver:
         except Exception:
             path_info = {}
         if (
-            ext not in VALID_GCODE_EXTS or
+            not is_gcode_file(rel_path) or
             path_info.get('size', 0) == 0
         ):
             evt = asyncio.Event()
@@ -1401,7 +2016,7 @@ class BaseFileSystemObserver:
                 file_path = parent_dir.joinpath(fname)
                 if (
                     not file_path.is_file() or
-                    file_path.suffix not in VALID_GCODE_EXTS
+                    not is_gcode_file(file_path.name)
                 ):
                     continue
                 mevt = self.parse_gcode_metadata(str(file_path))
@@ -1417,7 +2032,7 @@ class BaseFileSystemObserver:
             item_path = pathlib.Path(item_path)
         if root != "gcodes":
             return None
-        if item_path.is_file() and item_path.suffix in VALID_GCODE_EXTS:
+        if item_path.is_file() and is_gcode_file(item_path.name):
             ret = self.parse_gcode_metadata(str(item_path))
             return ret.wait()
         elif item_path.is_dir():
@@ -1447,7 +2062,7 @@ class BaseFileSystemObserver:
             # Need metadata scan
             if is_dir:
                 return self._scan_directory_metadata(dest_path)
-            elif dest_path.is_file() and dest_path.suffix in VALID_GCODE_EXTS:
+            elif dest_path.is_file() and is_gcode_file(dest_path.name):
                 mevt = self.parse_gcode_metadata(str(dest_path))
                 return mevt.wait()
         return None
@@ -2201,7 +2816,7 @@ class InotifyObserver(BaseFileSystemObserver):
             # want to notify the ufp since it will be removed.
             self.parse_gcode_metadata(file_path)
             return False
-        elif ext not in VALID_GCODE_EXTS:
+        elif not is_gcode_file(file_path):
             return True
         rel_path = self.file_manager.get_relative_path("gcodes", file_path)
         if (
@@ -2536,9 +3151,8 @@ class MetadataStorage:
         if fname in self.pending_requests:
             return self.pending_requests[fname][1]
         mevt = asyncio.Event()
-        ext = os.path.splitext(fname)[1]
         if (
-            ext not in VALID_GCODE_EXTS or
+            not is_gcode_file(fname) or
             self._has_valid_data(fname, path_info)
         ):
             # request already pending or not necessary
@@ -2601,6 +3215,8 @@ class MetadataStorage:
             "processors": list(self.processors.values())
         }
         timeout = self.default_metadata_parser_timeout
+        if three_mf.is_multi_plate_file(filename):
+            timeout = max(timeout, 120.)
         if ufp_path is not None or self.enable_object_proc:
             timeout = max(timeout, 300.)
         if self.processors:

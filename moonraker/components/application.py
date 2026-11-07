@@ -973,6 +973,7 @@ class FileUploadHandler(AuthorizedRequestHandler):
                 'root': ValueTarget(),
                 'print': ValueTarget(),
                 'path': ValueTarget(),
+                'plate': ValueTarget(),
                 'checksum': ValueTarget(),
             }
             self._file = FileTarget(tmpname)

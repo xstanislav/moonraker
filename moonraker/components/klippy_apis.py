@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from ..utils import Sentinel
 from ..common import WebRequest, APITransport, RequestType
+from .file_manager.three_mf import is_multi_plate_file
 
 # Annotation imports
 from typing import (
@@ -90,8 +91,9 @@ class KlippyAPI(APITransport):
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
+        plate = web_request.get_int('plate', None)
         user = web_request.get_current_user()
-        return await self.start_print(filename, user=user)
+        return await self.start_print(filename, user=user, plate=plate)
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("RESTART")
@@ -128,7 +130,8 @@ class KlippyAPI(APITransport):
         self,
         filename: str,
         wait_klippy_started: bool = False,
-        user: Optional[UserInfo] = None
+        user: Optional[UserInfo] = None,
+        plate: Optional[int] = None
     ) -> str:
         # WARNING: Do not call this method from within the following
         # event handlers when "wait_klippy_started" is set to True:
@@ -138,6 +141,11 @@ class KlippyAPI(APITransport):
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
+        if plate is not None or is_multi_plate_file(filename):
+            file_manager = self.server.lookup_component("file_manager")
+            filename = await file_manager.resolve_print_target(
+                filename, plate
+            )
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'

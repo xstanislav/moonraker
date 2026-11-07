@@ -23,6 +23,11 @@ import shlex
 import subprocess
 from PIL import Image
 
+try:
+    from . import three_mf
+except ImportError:  # executed as a script
+    import three_mf
+
 # Annotation imports
 from typing import (
     TYPE_CHECKING,
@@ -1345,6 +1350,11 @@ def extract_metadata(
     metadata.update(slicer.run_parsers())
     return metadata
 
+def extract_three_mf_metadata(file_path: str) -> Dict[str, Any]:
+    logger.info(f"Extracting multi-plate 3MF metadata: {file_path}")
+    return three_mf.parse_3mf(file_path)
+
+
 def extract_ufp(ufp_path: str, dest_path: str) -> None:
     if not os.path.isfile(ufp_path):
         logger.info(f"UFP file Not Found: {ufp_path}")
@@ -1401,7 +1411,10 @@ def main(config: Dict[str, Any]) -> None:
         logger.info(f"File Not Found: {file_path}")
         sys.exit(-1)
     try:
-        metadata = extract_metadata(file_path, processors)
+        if filename.lower().endswith(three_mf.MULTI_PLATE_SUFFIX):
+            metadata = extract_three_mf_metadata(file_path)
+        else:
+            metadata = extract_metadata(file_path, processors)
     except Exception:
         logger.info(traceback.format_exc())
         sys.exit(-1)

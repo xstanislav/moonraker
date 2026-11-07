@@ -43,8 +43,9 @@ GET /server/info
     ],
     "websocket_count": 2,
     "moonraker_version": "v0.7.1-105-ge4f103c",
-    "api_version": [1, 4, 0],
-    "api_version_string": "1.4.0"
+    "api_version": [1, 6, 0],
+    "api_version_string": "1.6.0",
+    "features": ["multi_plate_3mf"]
 }
 ```
 ////
@@ -67,6 +68,9 @@ GET /server/info
 | `moonraker_version`      |  string  | The version of the Moonraker Application.                |
 | `api_version`            |  [int]   | The version of the API in tuple format.                  |
 | `api_version_string`     |  string  | The version of the API in string format.                 |
+| `features`               | [string] | A list of optional features supported by this Moonraker  |
+|                          |          | build.  Currently `multi_plate_3mf` is reported when     |^
+|                          |          | multi-plate 3MF processing is enabled.                   |^
 
 | State          | Description                                                        |
 | -------------- | ------------------------------------------------------------------ |

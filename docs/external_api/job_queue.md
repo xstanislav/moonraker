@@ -87,6 +87,12 @@ GET /server/job_queue/status
 | Field           |  Type  | Description                                             |
 | --------------- | :----: | ------------------------------------------------------- |
 | `filename`      | string | The name of the gcode file queued.                      |
+| `source_filename` | string | The source file queued.  Identical to `filename` except |
+|                 |        | for extracted multi-plate G-Code, where it refers to    |^
+|                 |        | the `.gcode.3mf` project.                               |^
+| `plate`         |  int   | The plate index of the queued `.gcode.3mf` project,     |
+|                 |        | or `null` when the job is not plate based.              |^
+| `plate_name`    | string | The name of the queued plate, or `null` when unknown.   |^
 | `job_id`        | string | A unique ID assigned to the queued job.                 |
 | `time_added`    | float  | The time (in Unix Time) the job was added to the queue. |
 | `time_in_queue` | float  | The cumulative amount of time, in seconds, the job has  |
@@ -154,10 +160,16 @@ Multiple jobs should be comma separated as shown above.
 
 | Name        |   Type   | Default      | Description                                             |
 | ----------- | :------: | ------------ | ------------------------------------------------------- |
-| `filenames` | [string] | **REQUIRED** | An array of filenames of jobs to add to the queue.      |
+| `filenames` | [string] |              | An array of filenames of jobs to add to the queue.      |
 |             |          |              | The file names should be paths relative to the `gcodes` |^
 |             |          |              | root.  All of the specified files must exist, otherwise |^
-|             |          |              | the request will return with an error.                  |^
+|             |          |              | the request will return with an error.  Required unless |^
+|             |          |              | `jobs` is supplied.                                     |^
+| `jobs`      | [object] |              | An alternative to `filenames`, where each entry is an   |^
+|             |          |              | object with a `filename` field and an optional `plate`  |^
+|             |          |              | index for `.gcode.3mf` projects.                        |^
+| `plate`     |   int    |              | The plate index to apply to every file in `filenames`.  |^
+|             |          |              | Only valid for `.gcode.3mf` projects.                   |^
 | `reset`     |   bool   | false        | When set to `true` the job queue will be                |
 |             |          |              | cleared prior to adding the requested jobs.             |^
 

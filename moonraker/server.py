@@ -56,7 +56,8 @@ if TYPE_CHECKING:
     FlexCallback = Callable[..., Optional[Coroutine]]
     _T = TypeVar("_T", Sentinel, Any)
 
-API_VERSION = (1, 5, 0)
+API_VERSION = (1, 6, 0)
+FEATURES = ['multi_plate_3mf']
 SERVER_COMPONENTS = ['application', 'websockets', 'klippy_connection']
 CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'authorization',
@@ -514,6 +515,15 @@ class Server:
         reg_dirs = []
         if file_manager is not None:
             reg_dirs = file_manager.get_registered_dirs()
+        features = list(FEATURES)
+        if (
+            file_manager is not None and
+            not getattr(file_manager, "enable_multi_plate", False)
+        ):
+            features = [
+                feature for feature in features
+                if feature != "multi_plate_3mf"
+            ]
         mreqs = self.klippy_connection.missing_requirements
         if raw:
             warnings = list(self.warnings.values())
@@ -532,7 +542,8 @@ class Server:
             'moonraker_version': self.app_args['software_version'],
             'missing_klippy_requirements': mreqs,
             'api_version': API_VERSION,
-            'api_version_string': ".".join([str(v) for v in API_VERSION])
+            'api_version_string': ".".join([str(v) for v in API_VERSION]),
+            'features': features
         }
 
     async def _handle_config_request(self, web_request: WebRequest) -> Dict[str, Any]:
